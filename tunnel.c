@@ -1,135 +1,165 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <unistd.h>
 #include <time.h>
 
-// Nombre de bus et trajets
-#define NB_BUS_X    5
-#define NB_BUS_Y    4
-#define NB_TRAJETS  10
+#define N_X 5        // Nombre de bus à partir de X
+#define N_Y 4        // Nombre de bus à partir de Y
+#define N_TRIPS 10   // Allers-retours par bus
 
-// Mutex pour protéger les variables partagées
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+// Directions
+#define DIR_X 0
+#define DIR_Y 1
+#define DIR_NONE -1
 
-// Variables de contrôle du tunnel
-// sens_en_cours: -1 = libre, 0 = X->Y, 1 = Y->X
-static int sens_en_cours   = -1;
-static int nb_dans_tunnel  = 0;
-static int attente_X       = 0;
-static int attente_Y       = 0;
+// Sémaphores et variables partagées
+sem_t mutex;       // Protection des compteurs
+sem_t queue_X;     // File d'attente pour X
+sem_t queue_Y;     // File d'attente pour Y
 
-// Structure représentant un bus
-typedef struct {
-    int id;
-    int ville; // 0 = X, 1 = Y
-} Bus;
+int turn = DIR_NONE;  // Sens actuellement autorisé
+int waiting_X = 0;    // Bus en attente côté X
+int waiting_Y = 0;    // Bus en attente côté Y
+int in_tunnel = 0;    // Nombre de bus dans le tunnel
 
-// Fonction d’entrée dans le tunnel
-void entrer_tunnel(int ville) {
-    pthread_mutex_lock(&mutex);
-
-    // Incrémenter le compteur d'attente de ce sens
-    if (ville == 0) attente_X++;
-    else             attente_Y++;
-
-    // Tant que le tunnel est occupé dans l'autre sens, on attend
-    while (sens_en_cours != -1 && sens_en_cours != ville) {
-        pthread_mutex_unlock(&mutex);
-        usleep(10 * 1000); // 10 ms d'attente active
-        pthread_mutex_lock(&mutex);
-    }
-
-    // On peut entrer : décrémenter l'attente, augmenter nb_dans_tunnel
-    if (ville == 0) attente_X--;
-    else             attente_Y--;
-
-    nb_dans_tunnel++;
-    sens_en_cours = ville;
-
-    pthread_mutex_unlock(&mutex);
+// Utilitaires
+int opposite(int dir) {
+    return (dir == DIR_X) ? DIR_Y : DIR_X;
 }
 
-// Fonction de sortie du tunnel
-void sortir_tunnel(int ville) {
-    pthread_mutex_lock(&mutex);
+int waiting_same(int dir) {
+    return (dir == DIR_X) ? waiting_X : waiting_Y;
+}
 
-    nb_dans_tunnel--;
-    // Si plus personne dans le tunnel, on peut éventuellement changer de sens
-    if (nb_dans_tunnel == 0) {
-        // Si des bus attendent dans l'autre sens, on bascule
-        if ((ville == 0 && attente_Y > 0) ||
-            (ville == 1 && attente_X > 0)) {
-            sens_en_cours = 1 - ville;
+int waiting_opposite(int dir) {
+    return (dir == DIR_X) ? waiting_Y : waiting_X;
+}
+
+// Entrée dans le tunnel
+void enter_tunnel(int direction) {
+    sem_wait(&mutex);
+    if (turn == DIR_NONE) {
+        turn = direction;  // Premier bus fixe le sens
+    }
+    if (direction == turn && waiting_opposite(direction) == 0) {
+        in_tunnel++;
+        sem_post(&mutex);
+    } else {
+        if (direction == DIR_X) {
+            waiting_X++;
+            sem_post(&mutex);
+            sem_wait(&queue_X);
+            sem_wait(&mutex);
+            waiting_X--;
         } else {
-            sens_en_cours = -1;
+            waiting_Y++;
+            sem_post(&mutex);
+            sem_wait(&queue_Y);
+            sem_wait(&mutex);
+            waiting_Y--;
+        }
+        in_tunnel++;
+        sem_post(&mutex);
+    }
+}
+
+// Sortie du tunnel
+void exit_tunnel() {
+    sem_wait(&mutex);
+    in_tunnel--;
+    if (in_tunnel == 0) {
+        if (waiting_opposite(turn) > 0) {
+            turn = opposite(turn);  // Change de sens
+            int count = waiting_same(turn);
+            for (int i = 0; i < count; ++i) {
+                if (turn == DIR_X) sem_post(&queue_X);
+                else               sem_post(&queue_Y);
+            }
+        } else if (waiting_same(turn) > 0) {
+            int count = waiting_same(turn);
+            for (int i = 0; i < count; ++i) {
+                if (turn == DIR_X) sem_post(&queue_X);
+                else               sem_post(&queue_Y);
+            }
+        } else {
+            turn = DIR_NONE;  // Tunnel libre
         }
     }
-
-    pthread_mutex_unlock(&mutex);
+    sem_post(&mutex);
 }
 
-// Routine exécutée par chaque thread bus
-void* bus_routine(void* arg) {
-    Bus* bus = (Bus*)arg;
-    int depart = bus->ville;
-    int arrivee = 1 - depart;
-
-    for (int i = 1; i <= NB_TRAJETS; i++) {
-        // Trajet Aller
-        entrer_tunnel(depart);
-        printf("Bus %d de Ville %c : %c -> %c (Trajet %d)\n",
-               bus->id,
-               depart == 0 ? 'X' : 'Y',
-               depart == 0 ? 'X' : 'Y',
-               arrivee  == 0 ? 'X' : 'Y',
+// Thread de bus
+void* bus_thread(void* arg) {
+    int bus_id = ((int*)arg)[0];
+    int home = ((int*)arg)[1];
+    int other = opposite(home);
+    free(arg);
+    int i = 1;
+    while (i <= N_TRIPS) {
+        // Aller
+        printf("Bus %d de %s : %s->%s (Trajet %d aller)\n",
+               bus_id,
+               (home == DIR_X) ? "X" : "Y",
+               (home == DIR_X) ? "X" : "Y",
+               (home == DIR_X) ? "Y" : "X",
                i);
-        usleep((rand() % 500 + 1000) * 1000);
-
-        sortir_tunnel(depart);
-
-        // Trajet Retour
-        entrer_tunnel(arrivee);
-        printf("Bus %d de Ville %c : %c -> %c (Trajet %d)\n",
-               bus->id,
-               depart == 0 ? 'X' : 'Y',
-               arrivee  == 0 ? 'X' : 'Y',
-               depart   == 0 ? 'X' : 'Y',
+        enter_tunnel(home);
+        usleep((rand() % 500001) + 1000000);  // 1 à 1.5s
+        exit_tunnel();
+        // Retour
+        printf("Bus %d de %s : %s->%s (Trajet %d retour)\n",
+               bus_id,
+               (home == DIR_X) ? "X" : "Y",
+               (home == DIR_X) ? "Y" : "X",
+               (home == DIR_X) ? "X" : "Y",
                i);
-        usleep((rand() % 500 + 1000) * 1000);
-
-        sortir_tunnel(arrivee);
+        enter_tunnel(other);
+        usleep((rand() % 500001) + 1000000);
+        exit_tunnel();
+        i++;
     }
-
-    free(bus);
     return NULL;
 }
 
-int main(void) {
+int main() {
     srand(time(NULL));
-    pthread_t threads[NB_BUS_X + NB_BUS_Y];
+    pthread_t threads[N_X + N_Y];
 
-    // Création des bus de X
-    for (int i = 0; i < NB_BUS_X; i++) {
-        Bus* b = malloc(sizeof(Bus));
-        b->id    = i + 1;
-        b->ville = 0;
-        pthread_create(&threads[i], NULL, bus_routine, b);
+    // Init sémaphores
+    sem_init(&mutex, 0, 1);
+    sem_init(&queue_X, 0, 0);
+    sem_init(&queue_Y, 0, 0);
+
+    // Création threads avec while
+    int idx = 0;
+    int count = 0;
+    while (count < N_X) {
+        int* arg = malloc(2 * sizeof(int));
+        arg[0] = count + 1;
+        arg[1] = DIR_X;
+        pthread_create(&threads[idx++], NULL, bus_thread, arg);
+        count++;
+    }
+    count = 0;
+    while (count < N_Y) {
+        int* arg = malloc(2 * sizeof(int));
+        arg[0] = N_X + count + 1;
+        arg[1] = DIR_Y;
+        pthread_create(&threads[idx++], NULL, bus_thread, arg);
+        count++;
     }
 
-    // Création des bus de Y
-    for (int i = 0; i < NB_BUS_Y; i++) {
-        Bus* b = malloc(sizeof(Bus));
-        b->id    = i + 1;
-        b->ville = 1;
-        pthread_create(&threads[NB_BUS_X + i], NULL, bus_routine, b);
+    // Attente fin threads
+    int j = 0;
+    while (j < idx) {
+        pthread_join(threads[j++], NULL);
     }
 
-    // Attente de la fin de tous les threads
-    for (int i = 0; i < NB_BUS_X + NB_BUS_Y; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    pthread_mutex_destroy(&mutex);
+    // Destruction sémaphores
+    sem_destroy(&mutex);
+    sem_destroy(&queue_X);
+    sem_destroy(&queue_Y);
     return 0;
 }
