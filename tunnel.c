@@ -1,111 +1,135 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <pthread.h>
-#include <semaphore.h>
+#include <unistd.h>
 #include <time.h>
 
-#define NB_BUS_X 5
-#define NB_BUS_Y 4
-#define NB_TRIPS 10
+// Nombre de bus et trajets
+#define NB_BUS_X    5
+#define NB_BUS_Y    4
+#define NB_TRAJETS  10
 
-sem_t mutex;
-sem_t tunnel;
-int waiting_x = 0;
-int waiting_y = 0;
-int in_tunnel_x = 0;
-int in_tunnel_y = 0;
-char turn = 'X'; // Pour alterner les priorités
+// Mutex pour protéger les variables partagées
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void enter_tunnel(char ville_depart, int bus_id) {
-    int isX = (ville_depart == 'X');
-    
-    sem_wait(&mutex);
-    if (isX) waiting_x++;
-    else waiting_y++;
-    
-   
-    while ((isX && in_tunnel_y > 0) || (!isX && in_tunnel_x > 0) || 
-           ((turn != ville_depart) && ((isX && waiting_y > 0) || (!isX && waiting_x > 0)))) {
-        sem_post(&mutex);
-        sem_wait(&tunnel);
-        sem_wait(&mutex);
+// Variables de contrôle du tunnel
+// sens_en_cours: -1 = libre, 0 = X->Y, 1 = Y->X
+static int sens_en_cours   = -1;
+static int nb_dans_tunnel  = 0;
+static int attente_X       = 0;
+static int attente_Y       = 0;
+
+// Structure représentant un bus
+typedef struct {
+    int id;
+    int ville; // 0 = X, 1 = Y
+} Bus;
+
+// Fonction d’entrée dans le tunnel
+void entrer_tunnel(int ville) {
+    pthread_mutex_lock(&mutex);
+
+    // Incrémenter le compteur d'attente de ce sens
+    if (ville == 0) attente_X++;
+    else             attente_Y++;
+
+    // Tant que le tunnel est occupé dans l'autre sens, on attend
+    while (sens_en_cours != -1 && sens_en_cours != ville) {
+        pthread_mutex_unlock(&mutex);
+        usleep(10 * 1000); // 10 ms d'attente active
+        pthread_mutex_lock(&mutex);
     }
 
-    if (isX) {
-        waiting_x--;
-        in_tunnel_x++;
-    } else {
-        waiting_y--;
-        in_tunnel_y++;
-    }
+    // On peut entrer : décrémenter l'attente, augmenter nb_dans_tunnel
+    if (ville == 0) attente_X--;
+    else             attente_Y--;
 
-    sem_post(&mutex);
+    nb_dans_tunnel++;
+    sens_en_cours = ville;
+
+    pthread_mutex_unlock(&mutex);
 }
 
-void exit_tunnel(char ville_depart, int bus_id) {
-    int isX = (ville_depart == 'X');
+// Fonction de sortie du tunnel
+void sortir_tunnel(int ville) {
+    pthread_mutex_lock(&mutex);
 
-    sem_wait(&mutex);
-    if (isX) {
-        in_tunnel_x--;
-        if (in_tunnel_x == 0) {
-    
-            if (waiting_y > 0) turn = 'Y';
-            sem_post(&tunnel);
+    nb_dans_tunnel--;
+    // Si plus personne dans le tunnel, on peut éventuellement changer de sens
+    if (nb_dans_tunnel == 0) {
+        // Si des bus attendent dans l'autre sens, on bascule
+        if ((ville == 0 && attente_Y > 0) ||
+            (ville == 1 && attente_X > 0)) {
+            sens_en_cours = 1 - ville;
+        } else {
+            sens_en_cours = -1;
         }
-    } else {
-        in_tunnel_y--;
-        if (in_tunnel_y == 0) {
-            if (waiting_x > 0) turn = 'X';
-            sem_post(&tunnel);
-        }
     }
-    sem_post(&mutex);
+
+    pthread_mutex_unlock(&mutex);
 }
 
-void* bus(void* arg) {
-    int bus_id = *((int*)arg);
-    char ville = (bus_id < NB_BUS_X) ? 'X' : 'Y'; 
-    
-    for (int i = 1; i <= NB_TRIPS; i++) {
-       
-        enter_tunnel(ville, bus_id);
-        printf("Bus %d de %c : %c -> %c (Trajet %d)\n", 
-               bus_id, ville, ville, (ville == 'X') ? 'Y' : 'X', i);
-        usleep(1000000 + rand() % 500000);
-        exit_tunnel(ville, bus_id);
+// Routine exécutée par chaque thread bus
+void* bus_routine(void* arg) {
+    Bus* bus = (Bus*)arg;
+    int depart = bus->ville;
+    int arrivee = 1 - depart;
 
-     
-        char retour = (ville == 'X') ? 'Y' : 'X';
-        enter_tunnel(retour, bus_id);
-        printf("Bus %d de %c : %c -> %c (Trajet %d)\n", 
-               bus_id, ville, retour, ville, i);
-        usleep(1000000 + rand() % 500000);
-        exit_tunnel(retour, bus_id);
+    for (int i = 1; i <= NB_TRAJETS; i++) {
+        // Trajet Aller
+        entrer_tunnel(depart);
+        printf("Bus %d de Ville %c : %c -> %c (Trajet %d)\n",
+               bus->id,
+               depart == 0 ? 'X' : 'Y',
+               depart == 0 ? 'X' : 'Y',
+               arrivee  == 0 ? 'X' : 'Y',
+               i);
+        usleep((rand() % 500 + 1000) * 1000);
+
+        sortir_tunnel(depart);
+
+        // Trajet Retour
+        entrer_tunnel(arrivee);
+        printf("Bus %d de Ville %c : %c -> %c (Trajet %d)\n",
+               bus->id,
+               depart == 0 ? 'X' : 'Y',
+               arrivee  == 0 ? 'X' : 'Y',
+               depart   == 0 ? 'X' : 'Y',
+               i);
+        usleep((rand() % 500 + 1000) * 1000);
+
+        sortir_tunnel(arrivee);
     }
-    pthread_exit(NULL);
+
+    free(bus);
+    return NULL;
 }
 
-int main() {
-    pthread_t buses[NB_BUS_X + NB_BUS_Y];
-    int ids[NB_BUS_X + NB_BUS_Y];       
-    
-    sem_init(&mutex, 0, 1);
-    sem_init(&tunnel, 0, 1);
+int main(void) {
     srand(time(NULL));
+    pthread_t threads[NB_BUS_X + NB_BUS_Y];
 
-    for (int i = 0; i < NB_BUS_X + NB_BUS_Y; i++) {
-        ids[i] = i;
-        pthread_create(&buses[i], NULL, bus, &ids[i]);
+    // Création des bus de X
+    for (int i = 0; i < NB_BUS_X; i++) {
+        Bus* b = malloc(sizeof(Bus));
+        b->id    = i + 1;
+        b->ville = 0;
+        pthread_create(&threads[i], NULL, bus_routine, b);
     }
 
-    for (int i = 0; i < NB_BUS_X + NB_BUS_Y; i++) {
-        pthread_join(buses[i], NULL);
+    // Création des bus de Y
+    for (int i = 0; i < NB_BUS_Y; i++) {
+        Bus* b = malloc(sizeof(Bus));
+        b->id    = i + 1;
+        b->ville = 1;
+        pthread_create(&threads[NB_BUS_X + i], NULL, bus_routine, b);
     }
 
-    sem_destroy(&mutex);
-    sem_destroy(&tunnel);
-    
+    // Attente de la fin de tous les threads
+    for (int i = 0; i < NB_BUS_X + NB_BUS_Y; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    pthread_mutex_destroy(&mutex);
     return 0;
 }
